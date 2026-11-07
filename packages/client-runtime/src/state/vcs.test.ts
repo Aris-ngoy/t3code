@@ -40,6 +40,7 @@ import {
   commitVcsRefsRefresh,
   createVcsEnvironmentAtoms,
   makeCachedVcsRefsChanges,
+  resolveAmendUnavailableReason,
   resolveQuickAction,
 } from "./vcs.ts";
 import {
@@ -747,6 +748,21 @@ function status(overrides: Partial<VcsStatusResult> = {}): VcsStatusResult {
     ...overrides,
   };
 }
+
+describe("resolveAmendUnavailableReason", () => {
+  it.each([
+    { name: "an unpushed commit", overrides: { aheadCount: 1 }, reason: null },
+    { name: "a pushed commit", overrides: {}, reason: "The last commit is already pushed." },
+    {
+      name: "a branch with no commits of its own",
+      overrides: { hasUpstream: false },
+      reason: "No local commits to amend.",
+    },
+    { name: "a repository with no remote", overrides: { hasPrimaryRemote: false }, reason: null },
+  ])("reports whether $name can be amended without a force push", ({ overrides, reason }) => {
+    expect(resolveAmendUnavailableReason(status(overrides))).toBe(reason);
+  });
+});
 
 describe("resolveQuickAction", () => {
   it("commits local changes without pushing when the branch is behind upstream", () => {

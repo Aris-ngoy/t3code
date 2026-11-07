@@ -66,29 +66,29 @@ export function resolveGitActionProgressPresentation(input: {
   readonly phaseStartedAtMs: number | null;
   readonly hookStartedAtMs: number | null;
 }): GitActionProgressPresentation | null {
-  if (
-    !input.isRunning ||
-    (input.operation !== "run_change_request" && input.operation !== "pull")
-  ) {
-    return null;
-  }
-
+  if (!input.isRunning || input.operation === null) return null;
   const currentLabel = input.currentLabel?.trim();
-  const output = input.lastOutputLine?.trim();
-  const isPull = input.operation === "pull";
-  return {
-    status:
-      currentLabel && currentLabel !== "Running source control action"
-        ? currentLabel
-        : isPull
-          ? "Pulling latest changes..."
+  if (input.operation === "run_change_request") {
+    const output = input.lastOutputLine?.trim();
+    return {
+      status:
+        currentLabel && currentLabel !== "Running source control action"
+          ? currentLabel
           : "Starting source control action...",
-    output: !isPull && output ? output : null,
-    startedAtMs: isPull
-      ? input.phaseStartedAtMs
-      : (input.hookStartedAtMs ?? input.phaseStartedAtMs),
+      output: output ? output : null,
+      startedAtMs: input.hookStartedAtMs ?? input.phaseStartedAtMs,
+    };
+  }
+  if (!ROW_PROGRESS_OPERATIONS.has(input.operation)) return null;
+  return {
+    status: currentLabel || "Working...",
+    output: null,
+    startedAtMs: input.phaseStartedAtMs,
   };
 }
+
+// Operations that run from the Git actions row show their progress in it.
+const ROW_PROGRESS_OPERATIONS = new Set(["pull", "amend_commit", "rebase", "stash"]);
 
 export function formatGitActionElapsed(startedAtMs: number | null, nowMs: number): string | null {
   if (startedAtMs === null) {

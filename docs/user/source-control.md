@@ -170,6 +170,21 @@ the intended remote with `git branch --set-upstream-to=<remote>/<branch>`.
 Choose the writing style and model in **Settings → Source control**. **Repository conventions**
 uses the project's instructions and recent commit subjects.
 
+## Amend, rebase, and stash
+
+The Git actions menu also has:
+
+- **Amend last commit** adds the selected changes to the last commit and lets you edit its
+  message. Select no files to change only the message. It works only on a commit you have not
+  pushed, since amending a pushed commit would need a force push.
+- **Stash changes** sets aside every uncommitted change, new files included. **Git stashes** lists
+  them for searching, applying, or dropping. Stashes belong to the repository, so every worktree
+  sees the same list. Applying keeps the stash, so drop it once you no longer need it.
+
+When a rebase stops, which can happen when you or the agent started it in a terminal, the Git
+actions row shows its progress with **Continue** and **Abort**. Continue stays unavailable until
+every conflicted file is resolved and staged.
+
 ## Review and merge
 
 Open **Pull requests** to review changes and comments, request reviewers, check out a branch,

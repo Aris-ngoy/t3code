@@ -6,6 +6,7 @@ import {
   buildMenuItems,
   getGitActionDisabledReason,
   requiresDefaultBranchConfirmation,
+  resolveRebasePresentation,
 } from "@t3tools/client-runtime/state/vcs";
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
@@ -104,7 +105,12 @@ function GitOverviewSheetContent(props: GitOverviewSheetProps) {
   const hasPrimaryRemote = gitStatus.data?.hasPrimaryRemote ?? false;
   const isDefaultRef = gitStatus.data?.isDefaultRef ?? false;
 
-  const menuItems = isRepo ? buildMenuItems(gitStatus.data, busy, hasPrimaryRemote) : [];
+  const rebasePresentation = resolveRebasePresentation(gitStatus.data);
+  // Mid-rebase there is no branch to commit, push, or open a change request from.
+  const menuItems =
+    isRepo && rebasePresentation === null
+      ? buildMenuItems(gitStatus.data, busy, hasPrimaryRemote)
+      : [];
 
   const sheetMenuItems = menuItems.map((item) => ({
     item: {
@@ -244,6 +250,30 @@ function GitOverviewSheetContent(props: GitOverviewSheetProps) {
         <RefreshControl refreshing={isRefreshing} onRefresh={() => void handleRefresh()} />
       }
     >
+      {rebasePresentation ? (
+        <ListSection title={rebasePresentation.label}>
+          <ListRow
+            icon="arrow.right.circle"
+            label="Continue rebase"
+            description={
+              !canWriteSourceControl
+                ? "This connection cannot change source control."
+                : (rebasePresentation.continueDisabledReason ?? rebasePresentation.summary)
+            }
+            disabled={
+              !canWriteSourceControl || busy || rebasePresentation.continueDisabledReason !== null
+            }
+            onPress={() => void gitActions.onRebaseSelectedThread("continue")}
+          />
+          <ListRow
+            icon="arrow.uturn.backward"
+            label="Abort rebase"
+            description="Return the branch to where it was before the rebase"
+            disabled={!canWriteSourceControl || busy}
+            onPress={() => void gitActions.onRebaseSelectedThread("abort")}
+          />
+        </ListSection>
+      ) : null}
       <ListSection>
         {sheetMenuItems.map(({ item, disabledReason }) => (
           <ListRow

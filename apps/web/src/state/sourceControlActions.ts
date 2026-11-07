@@ -14,7 +14,10 @@ import {
   AuthSourceControlWriteScope,
   EnvironmentAuthorizationError,
   type EnvironmentId,
+  type GitAmendCommitInput,
+  type GitRebaseInput,
   type GitResolvePullRequestResult,
+  type GitStashInput,
   type SourceControlCloneProtocol,
   type SourceControlProviderKind,
   type SourceControlRepositoryVisibility,
@@ -37,7 +40,10 @@ export type SourceControlActionKind =
   | "pull"
   | "publishRepository"
   | "runStackedAction"
-  | "preparePullRequestThread";
+  | "preparePullRequestThread"
+  | "amendCommit"
+  | "rebase"
+  | "stash";
 
 export interface SourceControlActionScope {
   readonly environmentId: EnvironmentId | null;
@@ -68,6 +74,9 @@ const ACTION_OPERATION = {
   publishRepository: "publish_repository",
   runStackedAction: "run_change_request",
   preparePullRequestThread: "prepare_pull_request_thread",
+  amendCommit: "amend_commit",
+  rebase: "rebase",
+  stash: "stash",
 } as const satisfies Record<SourceControlActionKind, VcsActionOperation>;
 
 function useAction<
@@ -75,7 +84,7 @@ function useAction<
   R extends AtomCommandResult<unknown, unknown>,
 >(input: {
   readonly kind: SourceControlActionKind;
-  readonly label: string;
+  readonly label: string | ((...args: TArgs) => string);
   readonly scope: SourceControlActionScope;
   readonly action: (...args: TArgs) => Promise<R>;
   readonly onSuccess?: () => void;
@@ -120,7 +129,7 @@ function useAction<
           input.scope,
           {
             operation,
-            label: input.label,
+            label: typeof input.label === "function" ? input.label(...args) : input.label,
           },
           execute,
         );
@@ -214,6 +223,102 @@ export function useVcsPullAction(scope: SourceControlActionScope) {
     scope,
     action,
     onSuccess: status.refresh,
+  });
+}
+
+function unavailable(operation: VcsActionOperation, scope: SourceControlActionScope) {
+  return AsyncResult.failure<never, VcsActionUnavailableError>(
+    Cause.fail(
+      new VcsActionUnavailableError({
+        operation,
+        environmentId: scope.environmentId,
+        cwd: scope.cwd,
+      }),
+    ),
+  );
+}
+
+function useStatusRefresh(scope: SourceControlActionScope) {
+  return useEnvironmentQuery(
+    scope.environmentId !== null && scope.cwd !== null
+      ? vcsEnvironment.status({
+          environmentId: scope.environmentId,
+          input: { cwd: scope.cwd },
+        })
+      : null,
+  ).refresh;
+}
+
+export function useGitAmendAction(scope: SourceControlActionScope) {
+  const amendCommit = useAtomCommand(vcsEnvironment.amendCommit, { reportFailure: false });
+  const refresh = useStatusRefresh(scope);
+  const action = async (input: Omit<GitAmendCommitInput, "cwd">) => {
+    const target = resolveScope(scope);
+    if (target === null) return unavailable("amend_commit", scope);
+    return amendCommit({
+      environmentId: target.environmentId,
+      input: { ...input, cwd: target.cwd },
+    });
+  };
+  return useAction({
+    kind: "amendCommit",
+    label: "Amending commit...",
+    scope,
+    action,
+    onSuccess: refresh,
+  });
+}
+
+export function useGitRebaseAction(scope: SourceControlActionScope) {
+  const rebase = useAtomCommand(vcsEnvironment.rebase, { reportFailure: false });
+  const refresh = useStatusRefresh(scope);
+  const action = async (rebaseAction: GitRebaseInput["action"]) => {
+    const target = resolveScope(scope);
+    if (target === null) return unavailable("rebase", scope);
+    return rebase({
+      environmentId: target.environmentId,
+      input: { cwd: target.cwd, action: rebaseAction },
+    });
+  };
+  return useAction({
+    kind: "rebase",
+    label: (rebaseAction) =>
+      rebaseAction === "abort" ? "Aborting rebase..." : "Continuing rebase...",
+    scope,
+    action,
+    onSuccess: refresh,
+  });
+}
+
+type GitStashRequest = GitStashInput extends infer Input
+  ? Input extends GitStashInput
+    ? Omit<Input, "cwd">
+    : never
+  : never;
+
+const STASH_LABELS = {
+  push: "Stashing changes...",
+  apply: "Applying stash...",
+  drop: "Dropping stash...",
+} as const;
+
+export function useGitStashAction(scope: SourceControlActionScope) {
+  const stash = useAtomCommand(vcsEnvironment.stash, { reportFailure: false });
+  const refresh = useStatusRefresh(scope);
+  const action = async (request: GitStashRequest) => {
+    const target = resolveScope(scope);
+    if (target === null) return unavailable("stash", scope);
+    return stash({
+      environmentId: target.environmentId,
+      input: { ...request, cwd: target.cwd },
+    });
+  };
+  return useAction({
+    kind: "stash",
+    label: (request) => STASH_LABELS[request.action],
+    scope,
+    action,
+    onSuccess: refresh,
   });
 }
 

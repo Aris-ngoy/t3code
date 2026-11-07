@@ -9,7 +9,12 @@ import {
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
+  type AtomCommandResult,
 } from "@t3tools/client-runtime/state/runtime";
+import {
+  resolveAmendUnavailableReason,
+  resolveRebasePresentation,
+} from "@t3tools/client-runtime/state/vcs";
 import type {
   GitRunStackedActionResult,
   GitStackedAction,
@@ -21,11 +26,13 @@ import type {
 } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import * as Option from "effect/Option";
-import { useEffect, useEffectEvent, useRef, useState } from "react";
+import { type ReactNode, useEffect, useEffectEvent, useRef, useState } from "react";
 import { useDeadlinePassed } from "../hooks/useDeadline";
 import { useNowSecond } from "../hooks/useNowSecond";
 import { flushSync } from "react-dom";
 import {
+  ArchiveIcon,
+  ArchiveRestoreIcon,
   CheckIcon,
   ChevronDownIcon,
   CloudDownloadIcon,
@@ -33,9 +40,11 @@ import {
   FileDiffIcon,
   GitBranchPlusIcon,
   GitCommitIcon,
+  GitCompareArrowsIcon,
   InfoIcon,
   LockIcon,
   GlobeIcon,
+  PencilLineIcon,
 } from "lucide-react";
 import { Radio as RadioPrimitive } from "@base-ui/react/radio";
 import { RadioGroup } from "~/components/ui/radio-group";
@@ -76,7 +85,14 @@ import {
   DialogTitle,
 } from "~/components/ui/dialog";
 import { Input } from "~/components/ui/input";
-import { Menu, MenuItem, MenuItemLabel, MenuPopup, MenuTrigger } from "~/components/ui/menu";
+import {
+  Menu,
+  MenuItem,
+  MenuItemLabel,
+  MenuPopup,
+  MenuSeparator,
+  MenuTrigger,
+} from "~/components/ui/menu";
 import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { Textarea } from "~/components/ui/textarea";
@@ -84,7 +100,10 @@ import { stackedThreadToast, toastManager } from "~/components/ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { useOpenInPreferredEditor } from "~/editorPreferences";
 import {
+  useGitAmendAction,
+  useGitRebaseAction,
   useGitStackedAction,
+  useGitStashAction,
   useSourceControlActionRunning,
   useSourceControlPublishRepositoryAction,
   useVcsInitAction,
@@ -101,10 +120,12 @@ import { vcsActionManager, vcsEnvironment, vcsStatusRevalidation } from "~/state
 import { randomUUID } from "~/lib/utils";
 import { resolvePathLinkTarget } from "@t3tools/shared/fileLinks";
 import { type DraftId, useComposerDraftStore } from "~/composerDraftStore";
+import { GitStashesDialog } from "./GitStashesDialog";
 import {
   THREAD_DETAILS_PANEL_CHEVRON_CLASS,
   THREAD_DETAILS_PANEL_ICON_CLASS,
   THREAD_DETAILS_PANEL_LABEL_CLASS,
+  THREAD_DETAILS_PANEL_LOCKED_ROW_CLASS,
   THREAD_DETAILS_PANEL_SPLIT_GROUP_CLASS,
   THREAD_DETAILS_PANEL_SPLIT_SEPARATOR_CLASS,
 } from "./chat/threadDetailsPanelStyles";
@@ -166,7 +187,14 @@ function requestVcsStatusRefresh(
   }
   void refresh({ environmentId, input: { cwd } });
 }
-const RUNNING_SOURCE_CONTROL_ACTIONS = ["runStackedAction", "pull", "publishRepository"] as const;
+const RUNNING_SOURCE_CONTROL_ACTIONS = [
+  "runStackedAction",
+  "pull",
+  "publishRepository",
+  "amendCommit",
+  "rebase",
+  "stash",
+] as const;
 
 const PUBLISH_PROVIDER_OPTIONS = sourceControlClients.definitions.map((definition) => ({
   value: definition.kind,
@@ -273,9 +301,57 @@ function getMenuActionDisabledReason({
   return `Create ${terminology.singular} is currently unavailable.`;
 }
 
-const COMMIT_DIALOG_TITLE = "Commit changes";
-const COMMIT_DIALOG_DESCRIPTION =
-  "Review and confirm your commit. Leave the message blank to auto-generate one.";
+const COMMIT_DIALOG_COPY = {
+  commit: {
+    title: "Commit changes",
+    description: "Review and confirm your commit. Leave the message blank to auto-generate one.",
+  },
+  amend: {
+    title: "Amend last commit",
+    description:
+      "Add the selected changes to the last commit. Select no files to change only its message.",
+  },
+} as const;
+
+function GitMenuAction({
+  icon,
+  label,
+  disabledReason,
+  disabled,
+  onClick,
+}: {
+  icon: ReactNode;
+  label: string;
+  disabledReason: string | null;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  if (disabledReason) {
+    return (
+      <Popover>
+        <PopoverTrigger
+          openOnHover
+          nativeButton={false}
+          render={<span className="block w-full cursor-not-allowed" />}
+        >
+          <MenuItem className="w-full" disabled>
+            {icon}
+            <MenuItemLabel>{label}</MenuItemLabel>
+          </MenuItem>
+        </PopoverTrigger>
+        <PopoverPopup tooltipStyle side="left" align="center">
+          {disabledReason}
+        </PopoverPopup>
+      </Popover>
+    );
+  }
+  return (
+    <MenuItem disabled={disabled} onClick={onClick}>
+      {icon}
+      <MenuItemLabel>{label}</MenuItemLabel>
+    </MenuItem>
+  );
+}
 
 function GitActionItemIcon({
   icon,
@@ -968,7 +1044,13 @@ export default function GitActionsControl({
   const canChangeThreadBranch = canWriteSourceControl && (isLocalDraftThread || canOperateThread);
   const setDraftThreadContext = useComposerDraftStore((store) => store.setDraftThreadContext);
   const [isCommitDialogOpen, setIsCommitDialogOpen] = useState(false);
+  const [commitDialogMode, setCommitDialogMode] = useState<"commit" | "amend">("commit");
   const [dialogCommitMessage, setDialogCommitMessage] = useState("");
+  // Null until edited, so the amend dialog shows the last commit's message as it loads.
+  const [amendMessage, setAmendMessage] = useState<string | null>(null);
+  const [isStashDialogOpen, setIsStashDialogOpen] = useState(false);
+  const [stashMessage, setStashMessage] = useState("");
+  const [isStashesDialogOpen, setIsStashesDialogOpen] = useState(false);
   const [excludedFiles, setExcludedFiles] = useState<ReadonlySet<string>>(new Set());
   const [isEditingFiles, setIsEditingFiles] = useState(false);
   const [isPublishDialogOpen, setIsPublishDialogOpen] = useState(false);
@@ -1068,6 +1150,21 @@ export default function GitActionsControl({
   const initAction = useVcsInitAction(sourceControlScope);
   const runImmediateGitAction = useGitStackedAction(sourceControlScope);
   const pullAction = useVcsPullAction(sourceControlScope);
+  const amendAction = useGitAmendAction(sourceControlScope);
+  const rebaseAction = useGitRebaseAction(sourceControlScope);
+  const stashAction = useGitStashAction(sourceControlScope);
+  const headCommitMessageQuery = useEnvironmentQuery(
+    isCommitDialogOpen &&
+      commitDialogMode === "amend" &&
+      activeEnvironmentId !== null &&
+      gitCwd !== null
+      ? vcsEnvironment.headCommitMessage({
+          environmentId: activeEnvironmentId,
+          input: { cwd: gitCwd },
+        })
+      : null,
+  );
+  const headCommitMessage = headCommitMessageQuery.data?.message ?? null;
   const isGitActionRunning = useSourceControlActionRunning(
     sourceControlScope,
     RUNNING_SOURCE_CONTROL_ACTIONS,
@@ -1101,6 +1198,10 @@ export default function GitActionsControl({
   ]);
 
   const isDefaultRef = gitStatusForActions?.isDefaultRef ?? false;
+  const rebasePresentation = resolveRebasePresentation(gitStatusForActions);
+  const amendDisabledReason = isGitActionRunning
+    ? "Git action in progress."
+    : resolveAmendUnavailableReason(gitStatusForActions);
 
   const gitActionMenuItems = buildMenuItems(
     gitStatusForActions,
@@ -1150,6 +1251,92 @@ export default function GitActionsControl({
         : null,
     ),
   );
+
+  const toastFailure = (title: string, result: AtomCommandResult<unknown, unknown>) => {
+    if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return;
+    const error = squashAtomCommandFailure(result);
+    toastManager.add(
+      stackedThreadToast({
+        type: "error",
+        title,
+        description: error instanceof Error ? error.message : "An error occurred.",
+        timeout: resolveGitActionResultToastTiming("error").timeout,
+        ...(threadToastData !== undefined ? { data: threadToastData } : {}),
+      }),
+    );
+  };
+
+  const showInlineSuccess = (title: string) => {
+    setInlineSuccess({
+      title,
+      description: null,
+      scopeKey: successScopeKey,
+      expiresAtMs: inlineSuccessExpiresAt(),
+    });
+  };
+
+  const closeCommitDialog = () => {
+    setIsCommitDialogOpen(false);
+    setDialogCommitMessage("");
+    setAmendMessage(null);
+    setExcludedFiles(new Set());
+    setIsEditingFiles(false);
+  };
+
+  const openAmendDialog = () => {
+    setCommitDialogMode("amend");
+    setAmendMessage(null);
+    setExcludedFiles(new Set());
+    setIsEditingFiles(false);
+    setIsCommitDialogOpen(true);
+  };
+
+  const runAmend = () => {
+    if (!isCommitDialogOpen) return;
+    const message = amendMessage?.trim();
+    const commitMessage = message && message !== headCommitMessage ? message : undefined;
+    const filePaths = allSelected ? undefined : selectedFiles.map((f) => f.path);
+    closeCommitDialog();
+    void (async () => {
+      setInlineSuccess(null);
+      const result = await amendAction.run({
+        ...(commitMessage ? { commitMessage } : {}),
+        ...(filePaths ? { filePaths } : {}),
+      });
+      if (result._tag === "Success") showInlineSuccess("Amended last commit");
+      else toastFailure("Amend failed", result);
+    })();
+  };
+
+  const runRebase = (action: "continue" | "abort") => {
+    void (async () => {
+      setInlineSuccess(null);
+      const result = await rebaseAction.run(action);
+      if (result._tag === "Failure") {
+        toastFailure(action === "abort" ? "Abort failed" : "Continue failed", result);
+        return;
+      }
+      // A stopped rebase keeps its row, which already shows the new step.
+      if (result.value.status === "finished") showInlineSuccess("Rebase finished");
+      if (result.value.status === "aborted") showInlineSuccess("Rebase aborted");
+    })();
+  };
+
+  const closeStashDialog = () => {
+    setIsStashDialogOpen(false);
+    setStashMessage("");
+  };
+
+  const runStashPush = () => {
+    const message = stashMessage.trim();
+    closeStashDialog();
+    void (async () => {
+      setInlineSuccess(null);
+      const result = await stashAction.run({ action: "push", ...(message ? { message } : {}) });
+      if (result._tag === "Success") showInlineSuccess("Changes stashed");
+      else toastFailure("Stash failed", result);
+    })();
+  };
 
   async function runGitActionWithToast({
     action,
@@ -1266,11 +1453,7 @@ export default function GitActionsControl({
   const runDialogActionOnNewBranch = () => {
     if (!isCommitDialogOpen) return;
     const commitMessage = dialogCommitMessage.trim();
-
-    setIsCommitDialogOpen(false);
-    setDialogCommitMessage("");
-    setExcludedFiles(new Set());
-    setIsEditingFiles(false);
+    closeCommitDialog();
 
     void runGitActionWithToast({
       action: "commit",
@@ -1347,6 +1530,7 @@ export default function GitActionsControl({
       void runGitActionWithToast({ action: "create_pr" });
       return;
     }
+    setCommitDialogMode("commit");
     setExcludedFiles(new Set());
     setIsEditingFiles(false);
     setIsCommitDialogOpen(true);
@@ -1355,10 +1539,7 @@ export default function GitActionsControl({
   const runDialogAction = () => {
     if (!isCommitDialogOpen) return;
     const commitMessage = dialogCommitMessage.trim();
-    setIsCommitDialogOpen(false);
-    setDialogCommitMessage("");
-    setExcludedFiles(new Set());
-    setIsEditingFiles(false);
+    closeCommitDialog();
     void runGitActionWithToast({
       action: "commit",
       ...(commitMessage ? { commitMessage } : {}),
@@ -1415,46 +1596,28 @@ export default function GitActionsControl({
   };
   const gitItems = (
     <>
-      {gitActionMenuItems.map((item) => {
-        const disabledReason = getMenuActionDisabledReason({
-          item,
-          gitStatus: gitStatusForActions,
-          isBusy: isGitActionRunning,
-          hasPrimaryRemote,
-        });
-        if (item.disabled && disabledReason) {
-          return (
-            <Popover key={`${item.id}-${item.label}`}>
-              <PopoverTrigger
-                openOnHover
-                nativeButton={false}
-                render={<span className="block w-full cursor-not-allowed" />}
-              >
-                <MenuItem className="w-full" disabled>
-                  <GitActionItemIcon icon={item.icon} SourceControlIcon={SourceControlIcon} />
-                  <MenuItemLabel>{item.label}</MenuItemLabel>
-                </MenuItem>
-              </PopoverTrigger>
-              <PopoverPopup tooltipStyle side="left" align="center">
-                {disabledReason}
-              </PopoverPopup>
-            </Popover>
-          );
-        }
-
-        return (
-          <MenuItem
-            key={`${item.id}-${item.label}`}
-            disabled={!canWriteSourceControl || item.disabled}
-            onClick={() => {
-              openDialogForMenuItem(item);
-            }}
-          >
-            <GitActionItemIcon icon={item.icon} SourceControlIcon={SourceControlIcon} />
-            <MenuItemLabel>{item.label}</MenuItemLabel>
-          </MenuItem>
-        );
-      })}
+      {gitActionMenuItems.map((item) => (
+        <GitMenuAction
+          key={`${item.id}-${item.label}`}
+          icon={<GitActionItemIcon icon={item.icon} SourceControlIcon={SourceControlIcon} />}
+          label={item.label}
+          disabledReason={getMenuActionDisabledReason({
+            item,
+            gitStatus: gitStatusForActions,
+            isBusy: isGitActionRunning,
+            hasPrimaryRemote,
+          })}
+          disabled={!canWriteSourceControl || item.disabled}
+          onClick={() => openDialogForMenuItem(item)}
+        />
+      ))}
+      <GitMenuAction
+        icon={<PencilLineIcon />}
+        label="Amend last commit"
+        disabledReason={amendDisabledReason}
+        disabled={!canWriteSourceControl}
+        onClick={openAmendDialog}
+      />
       {canPublishRepository ? (
         <MenuItem
           disabled={isGitActionRunning}
@@ -1466,6 +1629,27 @@ export default function GitActionsControl({
           <MenuItemLabel>Publish repository...</MenuItemLabel>
         </MenuItem>
       ) : null}
+      <MenuSeparator />
+      <GitMenuAction
+        icon={<ArchiveIcon />}
+        label="Stash changes..."
+        disabledReason={
+          isGitActionRunning
+            ? "Git action in progress."
+            : gitStatusForActions?.hasWorkingTreeChanges
+              ? null
+              : "Worktree is clean. There is nothing to stash."
+        }
+        disabled={!canWriteSourceControl}
+        onClick={() => setIsStashDialogOpen(true)}
+      />
+      <GitMenuAction
+        icon={<ArchiveRestoreIcon />}
+        label="Git stashes..."
+        disabledReason={null}
+        disabled={false}
+        onClick={() => setIsStashesDialogOpen(true)}
+      />
       {gitStatusForActions?.refName === null && (
         <p className="px-2 py-1.5 text-xs text-warning">
           Detached HEAD: create and check out a branch to enable push and{" "}
@@ -1501,6 +1685,65 @@ export default function GitActionsControl({
             {initAction.isPending ? "Initializing..." : "Initialize Git"}
           </span>
         </ThreadDetailsControl>
+      ) : rebasePresentation && !gitActionProgress && !compact ? (
+        <div
+          role="group"
+          aria-label="Rebase in progress"
+          className="pb-1.5"
+          // Conflicts resolved in the terminal or by the agent show up without leaving the window.
+          onPointerEnter={() =>
+            requestVcsStatusRefresh(refreshVcsStatus, activeEnvironmentId, gitCwd)
+          }
+        >
+          <div className={cn(THREAD_DETAILS_PANEL_LOCKED_ROW_CLASS, "flex items-center")}>
+            <GitCompareArrowsIcon className={THREAD_DETAILS_PANEL_ICON_CLASS} aria-hidden />
+            <span className={cn("min-w-0 flex-1 truncate", THREAD_DETAILS_PANEL_LABEL_CLASS)}>
+              {rebasePresentation.label}
+            </span>
+          </div>
+          <div className="mt-1.5 flex h-5 min-w-0 items-center gap-0.5 ps-9 pe-2.5 text-xs text-muted-foreground">
+            <span className="min-w-0 truncate">{rebasePresentation.summary}</span>
+            <span className="flex-1" />
+            <ThreadDetailsControl
+              type="button"
+              variant="ghost"
+              size="sm"
+              part="meta"
+              tone="destructive"
+              disabled={!canWriteSourceControl || isGitActionRunning}
+              onClick={() => runRebase("abort")}
+            >
+              Abort
+            </ThreadDetailsControl>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  // A disabled button gets no hover, so the span carries the reason's tooltip.
+                  <span className="inline-flex" />
+                }
+              >
+                <ThreadDetailsControl
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  part="meta"
+                  tone="primary"
+                  disabled={
+                    !canWriteSourceControl ||
+                    isGitActionRunning ||
+                    rebasePresentation.continueDisabledReason !== null
+                  }
+                  onClick={() => runRebase("continue")}
+                >
+                  Continue
+                </ThreadDetailsControl>
+              </TooltipTrigger>
+              <TooltipPopup side="top">
+                {rebasePresentation.continueDisabledReason ?? "Commit this step and carry on."}
+              </TooltipPopup>
+            </Tooltip>
+          </div>
+        </div>
       ) : quietEmptyDraft || (compact && !gitActionProgress && !visibleInlineSuccess) ? null : (
         <div
           role="group"
@@ -1682,18 +1925,15 @@ export default function GitActionsControl({
       <Dialog
         open={isCommitDialogOpen}
         onOpenChange={(open) => {
-          if (!open) {
-            setIsCommitDialogOpen(false);
-            setDialogCommitMessage("");
-            setExcludedFiles(new Set());
-            setIsEditingFiles(false);
-          }
+          if (!open) closeCommitDialog();
         }}
       >
         <DialogPopup>
           <DialogHeader>
-            <DialogTitle>{COMMIT_DIALOG_TITLE}</DialogTitle>
-            <DialogDescription>{COMMIT_DIALOG_DESCRIPTION}</DialogDescription>
+            <DialogTitle>{COMMIT_DIALOG_COPY[commitDialogMode].title}</DialogTitle>
+            <DialogDescription>
+              {COMMIT_DIALOG_COPY[commitDialogMode].description}
+            </DialogDescription>
           </DialogHeader>
           <DialogPanel>
             <div className="space-y-3 rounded-xl bg-zinc-25 p-3 text-sm ring-1 ring-black/5 dark:bg-white/[0.035] dark:ring-white/5">
@@ -1813,47 +2053,108 @@ export default function GitActionsControl({
                 )}
               </div>
             </div>
-            <div className="space-y-1">
-              <p className="text-sm font-medium">Commit message (optional)</p>
-              <Textarea
-                value={dialogCommitMessage}
-                onChange={(event) => setDialogCommitMessage(event.target.value)}
-                placeholder="Leave empty to auto-generate"
-                size="sm"
-              />
-            </div>
+            {commitDialogMode === "amend" ? (
+              <div className="space-y-1">
+                <p className="text-sm font-medium">Commit message</p>
+                <Textarea
+                  value={amendMessage ?? headCommitMessage ?? ""}
+                  onChange={(event) => setAmendMessage(event.target.value)}
+                  placeholder={
+                    headCommitMessageQuery.isPending
+                      ? "Loading message..."
+                      : "Keep the current message"
+                  }
+                  size="sm"
+                />
+              </div>
+            ) : (
+              <div className="space-y-1">
+                <p className="text-sm font-medium">Commit message (optional)</p>
+                <Textarea
+                  value={dialogCommitMessage}
+                  onChange={(event) => setDialogCommitMessage(event.target.value)}
+                  placeholder="Leave empty to auto-generate"
+                  size="sm"
+                />
+              </div>
+            )}
           </DialogPanel>
           <DialogFooter variant="bare">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                setIsCommitDialogOpen(false);
-                setDialogCommitMessage("");
-                setExcludedFiles(new Set());
-                setIsEditingFiles(false);
-              }}
-            >
+            <Button variant="outline" size="sm" onClick={closeCommitDialog}>
               Cancel
             </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!canChangeThreadBranch || noneSelected}
-              onClick={runDialogActionOnNewBranch}
-            >
-              Commit on new branch
+            {commitDialogMode === "amend" ? (
+              <Button size="sm" disabled={!canWriteSourceControl} onClick={runAmend}>
+                Amend
+              </Button>
+            ) : (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!canChangeThreadBranch || noneSelected}
+                  onClick={runDialogActionOnNewBranch}
+                >
+                  Commit on new branch
+                </Button>
+                <Button
+                  size="sm"
+                  disabled={!canWriteSourceControl || noneSelected}
+                  onClick={runDialogAction}
+                >
+                  Commit
+                </Button>
+              </>
+            )}
+          </DialogFooter>
+        </DialogPopup>
+      </Dialog>
+
+      <Dialog
+        open={isStashDialogOpen}
+        onOpenChange={(open) => {
+          if (!open) closeStashDialog();
+        }}
+      >
+        <DialogPopup className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Stash changes</DialogTitle>
+            <DialogDescription>
+              Set aside every uncommitted change, new files included, to apply later from Git
+              stashes.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogPanel>
+            <Input
+              aria-label="Stash message"
+              placeholder="Message (optional)"
+              value={stashMessage}
+              onChange={(event) => setStashMessage(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && canWriteSourceControl) {
+                  event.preventDefault();
+                  runStashPush();
+                }
+              }}
+            />
+          </DialogPanel>
+          <DialogFooter variant="bare">
+            <Button variant="outline" size="sm" onClick={closeStashDialog}>
+              Cancel
             </Button>
-            <Button
-              size="sm"
-              disabled={!canWriteSourceControl || noneSelected}
-              onClick={runDialogAction}
-            >
-              Commit
+            <Button size="sm" disabled={!canWriteSourceControl} onClick={runStashPush}>
+              Stash
             </Button>
           </DialogFooter>
         </DialogPopup>
       </Dialog>
+
+      <GitStashesDialog
+        open={isStashesDialogOpen}
+        onOpenChange={setIsStashesDialogOpen}
+        environmentId={activeEnvironmentId}
+        gitCwd={gitCwd}
+      />
 
       {/* Its discovery query should stop when the Git actions row that opens it is hidden. */}
       {showActions ? (

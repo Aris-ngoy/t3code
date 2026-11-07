@@ -5590,6 +5590,133 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
     );
   });
 
+  describe("rebase, amend, and stashes", () => {
+    const gitAllowingFailure = (cwd: string, args: ReadonlyArray<string>) =>
+      Effect.flatMap(GitVcsDriver.GitVcsDriver, (driver) =>
+        driver.execute({
+          operation: "GitVcsDriver.test.git",
+          cwd,
+          args,
+          env: { GIT_EDITOR: "true" },
+          allowNonZeroExit: true,
+          timeoutMs: 10_000,
+        }),
+      );
+
+    it.effect("reports each stopped rebase step and continues only once conflicts are staged", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* writeTextFile(cwd, "a.txt", "base\n");
+        yield* writeTextFile(cwd, "b.txt", "base\n");
+        yield* git(cwd, ["add", "."]);
+        yield* git(cwd, ["commit", "-m", "base"]);
+        yield* git(cwd, ["checkout", "-b", "feature"]);
+        yield* writeTextFile(cwd, "a.txt", "feature\n");
+        yield* git(cwd, ["commit", "-am", "feature a"]);
+        yield* writeTextFile(cwd, "b.txt", "feature\n");
+        yield* git(cwd, ["commit", "-am", "feature b"]);
+        yield* git(cwd, ["checkout", initialBranch]);
+        yield* writeTextFile(cwd, "a.txt", "main\n");
+        yield* writeTextFile(cwd, "b.txt", "main\n");
+        yield* git(cwd, ["commit", "-am", "main"]);
+        yield* git(cwd, ["checkout", "feature"]);
+        yield* gitAllowingFailure(cwd, ["rebase", initialBranch]);
+
+        const stopped = yield* driver.statusDetailsLocal(cwd);
+        assert.isNull(stopped.branch);
+        assert.deepEqual(stopped.rebase, {
+          refName: "feature",
+          step: 1,
+          total: 2,
+          conflictedFileCount: 1,
+        });
+        const unresolved = yield* Effect.flip(driver.rebase({ cwd, action: "continue" }));
+        assert.include(unresolved.detail, "Resolve and stage");
+
+        yield* writeTextFile(cwd, "a.txt", "resolved\n");
+        yield* git(cwd, ["add", "a.txt"]);
+        // Git exits non-zero on the next conflict; that is progress, not a failure.
+        assert.deepEqual(yield* driver.rebase({ cwd, action: "continue" }), {
+          status: "stopped",
+        });
+        assert.deepInclude((yield* driver.statusDetailsLocal(cwd)).rebase, { step: 2 });
+
+        yield* writeTextFile(cwd, "b.txt", "resolved\n");
+        yield* git(cwd, ["add", "b.txt"]);
+        assert.deepEqual(yield* driver.rebase({ cwd, action: "continue" }), {
+          status: "finished",
+        });
+        const finished = yield* driver.statusDetailsLocal(cwd);
+        assert.equal(finished.branch, "feature");
+        assert.isUndefined(finished.rebase);
+        assert.equal(yield* git(cwd, ["log", "-1", "--format=%s"]), "feature b");
+      }),
+    );
+
+    it.effect(
+      "amends only unpushed commits, rewording without staging when no files are picked",
+      () =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          const remote = yield* makeTmpDir("git-vcs-driver-remote-");
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+          yield* git(remote, ["init", "--bare"]);
+          yield* git(cwd, ["remote", "add", "origin", remote]);
+          yield* git(cwd, ["push", "-u", "origin", initialBranch]);
+
+          const pushed = yield* Effect.flip(driver.amendCommit({ cwd, commitMessage: "nope" }));
+          assert.include(pushed.detail, "already pushed");
+
+          yield* writeTextFile(cwd, "local.txt", "one\n");
+          yield* git(cwd, ["add", "."]);
+          yield* git(cwd, ["commit", "-m", "local"]);
+          yield* writeTextFile(cwd, "local.txt", "one\ntwo\n");
+          yield* driver.amendCommit({
+            cwd,
+            commitMessage: "reworded\n\nwith a body",
+            filePaths: [],
+          });
+          assert.equal(yield* driver.readHeadCommitMessage(cwd), "reworded\n\nwith a body");
+          assert.equal(yield* git(cwd, ["status", "--porcelain"]), "M local.txt");
+
+          yield* driver.amendCommit({ cwd });
+          assert.equal(yield* git(cwd, ["status", "--porcelain"]), "");
+          assert.equal(yield* git(cwd, ["log", "-1", "--format=%s"]), "reworded");
+          assert.equal(yield* git(cwd, ["rev-list", "--count", "HEAD"]), "2");
+        }),
+    );
+
+    it.effect("applies and drops stashes by commit after the list shifts", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* writeTextFile(cwd, "untracked.txt", "first\n");
+        yield* driver.stash({ cwd, action: "push", message: "first stash" });
+        assert.equal(yield* git(cwd, ["status", "--porcelain"]), "");
+        const [first] = (yield* driver.listStashes(cwd)).stashes;
+        assert.deepInclude(first, { refName: initialBranch, message: "first stash" });
+
+        yield* writeTextFile(cwd, "README.md", "# second\n");
+        yield* driver.stash({ cwd, action: "push" });
+        const { stashes } = yield* driver.listStashes(cwd);
+        assert.lengthOf(stashes, 2);
+        assert.equal(stashes[1]!.sha, first!.sha);
+
+        yield* driver.stash({ cwd, action: "apply", sha: first!.sha });
+        assert.equal(yield* git(cwd, ["status", "--porcelain"]), "?? untracked.txt");
+        yield* driver.stash({ cwd, action: "drop", sha: first!.sha });
+        assert.deepEqual(
+          (yield* driver.listStashes(cwd)).stashes.map((entry) => entry.sha),
+          [stashes[0]!.sha],
+        );
+      }),
+    );
+  });
+
   describe("commit context", () => {
     it.effect("prepares source patches without running textconv", () =>
       Effect.gen(function* () {

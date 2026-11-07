@@ -27,6 +27,15 @@ import {
   type VcsStatusLocalResult,
   type VcsStatusRemoteResult,
   type VcsStatusResult,
+  type GitAmendCommitInput,
+  type GitAmendCommitResult,
+  type GitListStashesInput,
+  type GitListStashesResult,
+  type GitReadHeadCommitMessageInput,
+  type GitReadHeadCommitMessageResult,
+  type GitRebaseInput,
+  type GitRebaseResult,
+  type GitStashInput,
 } from "@t3tools/contracts";
 
 import * as GitManager from "./GitManager.ts";
@@ -125,6 +134,17 @@ export class GitWorkflowService extends Context.Service<
     readonly switchRef: (
       input: VcsSwitchRefInput,
     ) => Effect.Effect<VcsSwitchRefResult, GitCommandError>;
+    readonly amendCommit: (
+      input: GitAmendCommitInput,
+    ) => Effect.Effect<GitAmendCommitResult, GitCommandError>;
+    readonly readHeadCommitMessage: (
+      input: GitReadHeadCommitMessageInput,
+    ) => Effect.Effect<GitReadHeadCommitMessageResult, GitCommandError>;
+    readonly rebase: (input: GitRebaseInput) => Effect.Effect<GitRebaseResult, GitCommandError>;
+    readonly listStashes: (
+      input: GitListStashesInput,
+    ) => Effect.Effect<GitListStashesResult, GitCommandError>;
+    readonly stash: (input: GitStashInput) => Effect.Effect<void, GitCommandError>;
     readonly renameBranch: (input: {
       readonly exactName?: boolean;
       readonly cwd: string;
@@ -485,6 +505,36 @@ export const make = Effect.gen(function* () {
         Effect.flatMap((handle) =>
           withCheckoutLease(handle.repository.rootPath, Effect.scoped(git.switchRef(input))),
         ),
+      );
+    }),
+    amendCommit: Effect.fn("GitWorkflowService.amendCommit")(function (input) {
+      return ensureGitCommand("GitWorkflowService.amendCommit", input.cwd).pipe(
+        Effect.flatMap((handle) =>
+          withCheckoutLease(handle.repository.rootPath, git.amendCommit(input)),
+        ),
+      );
+    }),
+    readHeadCommitMessage: Effect.fn("GitWorkflowService.readHeadCommitMessage")(function (input) {
+      return ensureGitCommand("GitWorkflowService.readHeadCommitMessage", input.cwd).pipe(
+        Effect.andThen(git.readHeadCommitMessage(input.cwd)),
+        Effect.map((message) => ({ message })),
+      );
+    }),
+    rebase: Effect.fn("GitWorkflowService.rebase")(function (input) {
+      return ensureGitCommand("GitWorkflowService.rebase", input.cwd).pipe(
+        Effect.flatMap((handle) =>
+          withCheckoutLease(handle.repository.rootPath, git.rebase(input)),
+        ),
+      );
+    }),
+    listStashes: Effect.fn("GitWorkflowService.listStashes")(function (input) {
+      return ensureGitCommand("GitWorkflowService.listStashes", input.cwd).pipe(
+        Effect.andThen(git.listStashes(input.cwd)),
+      );
+    }),
+    stash: Effect.fn("GitWorkflowService.stash")(function (input) {
+      return ensureGitCommand("GitWorkflowService.stash", input.cwd).pipe(
+        Effect.flatMap((handle) => withCheckoutLease(handle.repository.rootPath, git.stash(input))),
       );
     }),
     renameBranch: Effect.fn("GitWorkflowService.renameBranch")(function (input) {
