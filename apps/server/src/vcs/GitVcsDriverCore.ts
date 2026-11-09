@@ -24,6 +24,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import {
   GitCommandError,
   type GitCommandFailureReason,
+  type GitListStashesResult,
   T3_PROJECT_FILE_NAME,
   type ReviewBranchCommitsInput,
   type ReviewDiffFileContentsInput,
@@ -564,6 +565,37 @@ function isMissingGitCwdError(error: GitCommandError): boolean {
 function isNonRepositoryGitStderr(stderr: string): boolean {
   return stderr.toLowerCase().includes("not a git repository");
 }
+const COMMIT_HOOK_TIMEOUT_MS = 10 * 60_000;
+
+// %gs is "On <branch>: <message>" for a named stash and "WIP on <branch>: <sha> <subject>" otherwise.
+const STASH_SUBJECT_PATTERN = /^(?:WIP on|On) (.+?): ([\s\S]*)$/;
+
+function parseStashList(stdout: string): GitListStashesResult["stashes"] {
+  return stdout.split("\0").flatMap((record) => {
+    const [sha, subject, createdAt] = record.trim().split("\x1f");
+    if (!sha || subject === undefined || !createdAt) return [];
+    const match = STASH_SUBJECT_PATTERN.exec(subject);
+    const refName = match?.[1] && match[1] !== "(no branch)" ? match[1] : null;
+    return [{ sha, refName, message: match?.[2] ?? subject, createdAt }];
+  });
+}
+
+// Fixed text only: stderr can name files the caller should not see verbatim in a toast.
+function stashApplyFailureDetail(stderr: string): string {
+  if (/would be overwritten|already exists, no checkout/i.test(stderr)) {
+    return "Applying this stash would overwrite uncommitted changes. Commit or stash them first.";
+  }
+  if (/CONFLICT/.test(stderr)) {
+    return "The stash applied with conflicts. Resolve them in the changed files; the stash was kept.";
+  }
+  return "Git could not apply the stash. The stash was kept.";
+}
+
+function parseRebaseCount(value: string | null): number | null {
+  const parsed = value === null ? Number.NaN : Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
 function isUnbornHeadStderr(stderr: string): boolean {
   const normalized = stderr.toLowerCase();
   return (
@@ -2103,6 +2135,39 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     };
   });
 
+  // Mid-rebase, status reports a detached HEAD; Git's rebase state names the branch and step.
+  const readRebaseState = Effect.fn("readRebaseState")(function* (gitDir: string) {
+    const readState = (directory: string, name: string) =>
+      fileSystem.readFileString(path.join(gitDir, directory, name)).pipe(
+        Effect.map((value) => value.trim()),
+        Effect.orElseSucceed(() => null),
+      );
+    const exists = (relativePath: string) =>
+      fileSystem.exists(path.join(gitDir, relativePath)).pipe(Effect.orElseSucceed(() => false));
+    // `git am` also uses rebase-apply, without the `rebasing` marker.
+    const directory = (yield* exists("rebase-merge"))
+      ? { name: "rebase-merge", step: "msgnum", total: "end" }
+      : (yield* exists("rebase-apply/rebasing"))
+        ? { name: "rebase-apply", step: "next", total: "last" }
+        : null;
+    if (directory === null) return null;
+    const [headName, step, total] = yield* Effect.all(
+      [
+        readState(directory.name, "head-name"),
+        readState(directory.name, directory.step),
+        readState(directory.name, directory.total),
+      ],
+      { concurrency: "unbounded" },
+    );
+    return {
+      refName: headName?.startsWith("refs/heads/")
+        ? headName.slice("refs/heads/".length) || null
+        : null,
+      step: parseRebaseCount(step),
+      total: parseRebaseCount(total),
+    };
+  });
+
   const readStatusDetailsLocal = Effect.fn("readStatusDetailsLocal")(function* (
     cwd: string,
     options?: GitVcsDriver.GitLocalStatusOptions,
@@ -2127,6 +2192,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       }),
     );
     if (indexResult === null) return NON_REPOSITORY_STATUS_DETAILS;
+    const gitDir =
+      indexResult.exitCode === 0
+        ? path.dirname(path.resolve(cwd, indexResult.stdout.trim()))
+        : null;
     if (indexResult.exitCode === 0) {
       const lockPath = `${path.resolve(cwd, indexResult.stdout.trim())}.lock`;
       const lockError = new GitCommandError({
@@ -2170,70 +2239,72 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       }),
     );
     // diff-index does not read status output, so both spawn together; a non-repository discards it.
-    const [statusResult, numstatResult, defaultBranch, hasPrimaryRemote] = yield* Effect.all(
-      [
-        readStatus,
-        // Porcelain diff rewrites indexes despite GIT_OPTIONAL_LOCKS=0; plumbing with -M preserves rename detection.
-        executeGitWithStableDiagnostics(
-          "GitVcsDriver.statusDetails.numstat",
-          cwd,
-          ["diff-index", "-M", "--numstat", "-z", "HEAD", "--"],
-          { allowNonZeroExit: true, maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES },
-        ).pipe(
-          Effect.flatMap((result) => {
-            if (result.exitCode === 0) return Effect.succeed(parseReviewNumstat(result.stdout));
-            if (isUnbornHeadStderr(result.stderr)) {
-              return Effect.map(
-                Effect.all([
-                  runGitStdoutWithOptions(
-                    "GitVcsDriver.statusDetails.numstat.unborn",
+    const [statusResult, numstatResult, defaultBranch, hasPrimaryRemote, rebase] =
+      yield* Effect.all(
+        [
+          readStatus,
+          // Porcelain diff rewrites indexes despite GIT_OPTIONAL_LOCKS=0; plumbing with -M preserves rename detection.
+          executeGitWithStableDiagnostics(
+            "GitVcsDriver.statusDetails.numstat",
+            cwd,
+            ["diff-index", "-M", "--numstat", "-z", "HEAD", "--"],
+            { allowNonZeroExit: true, maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES },
+          ).pipe(
+            Effect.flatMap((result) => {
+              if (result.exitCode === 0) return Effect.succeed(parseReviewNumstat(result.stdout));
+              if (isUnbornHeadStderr(result.stderr)) {
+                return Effect.map(
+                  Effect.all([
+                    runGitStdoutWithOptions(
+                      "GitVcsDriver.statusDetails.numstat.unborn",
+                      cwd,
+                      ["diff-files", "--numstat", "-z"],
+                      { maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES },
+                    ),
+                    runGitStdoutWithOptions(
+                      "GitVcsDriver.statusDetails.numstat.unborn.staged",
+                      cwd,
+                      ["diff", "--cached", "--numstat", "-z"],
+                      { maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES },
+                    ),
+                  ]),
+                  ([unstagedStdout, stagedStdout]) => [
+                    ...parseReviewNumstat(stagedStdout),
+                    ...parseReviewNumstat(unstagedStdout),
+                  ],
+                );
+              }
+              return Effect.fail(
+                new GitCommandError({
+                  ...gitCommandContext({
+                    operation: "GitVcsDriver.statusDetails.numstat",
                     cwd,
-                    ["diff-files", "--numstat", "-z"],
-                    { maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES },
-                  ),
-                  runGitStdoutWithOptions(
-                    "GitVcsDriver.statusDetails.numstat.unborn.staged",
-                    cwd,
-                    ["diff", "--cached", "--numstat", "-z"],
-                    { maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES },
-                  ),
-                ]),
-                ([unstagedStdout, stagedStdout]) => [
-                  ...parseReviewNumstat(stagedStdout),
-                  ...parseReviewNumstat(unstagedStdout),
-                ],
-              );
-            }
-            return Effect.fail(
-              new GitCommandError({
-                ...gitCommandContext({
-                  operation: "GitVcsDriver.statusDetails.numstat",
-                  cwd,
-                  args: ["diff-index", "-M", "--numstat", "-z", "HEAD", "--"],
+                    args: ["diff-index", "-M", "--numstat", "-z", "HEAD", "--"],
+                  }),
+                  detail: "git diff-index HEAD --numstat failed.",
+                  exitCode: result.exitCode,
+                  stdoutLength: result.stdout.length,
+                  stderrLength: result.stderr.length,
                 }),
-                detail: "git diff-index HEAD --numstat failed.",
-                exitCode: result.exitCode,
-                stdoutLength: result.stdout.length,
-                stderrLength: result.stderr.length,
-              }),
-            );
-          }),
-          Effect.result,
-        ),
-        statusCacheKey
-          ? Cache.get(defaultBranchCache, statusCacheKey).pipe(Effect.orElseSucceed(() => null))
-          : resolveDefaultBranchName(cwd, "origin").pipe(Effect.orElseSucceed(() => null)),
-        statusCacheKey
-          ? Cache.get(primaryRemoteExistsCache, statusCacheKey).pipe(
-              Effect.orElseSucceed(() => false),
-            )
-          : listRemoteNames(cwd).pipe(
-              Effect.map((remoteNames) => remoteNames.length > 0),
-              Effect.orElseSucceed(() => false),
-            ),
-      ],
-      { concurrency: "unbounded" },
-    );
+              );
+            }),
+            Effect.result,
+          ),
+          statusCacheKey
+            ? Cache.get(defaultBranchCache, statusCacheKey).pipe(Effect.orElseSucceed(() => null))
+            : resolveDefaultBranchName(cwd, "origin").pipe(Effect.orElseSucceed(() => null)),
+          statusCacheKey
+            ? Cache.get(primaryRemoteExistsCache, statusCacheKey).pipe(
+                Effect.orElseSucceed(() => false),
+              )
+            : listRemoteNames(cwd).pipe(
+                Effect.map((remoteNames) => remoteNames.length > 0),
+                Effect.orElseSucceed(() => false),
+              ),
+          gitDir === null ? Effect.succeed(null) : readRebaseState(gitDir),
+        ],
+        { concurrency: "unbounded" },
+      );
     if (statusResult === null) {
       return NON_REPOSITORY_STATUS_DETAILS;
     }
@@ -2264,6 +2335,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     let behindCount = 0;
     let aheadOfDefaultCount = 0;
     let hasWorkingTreeChanges = false;
+    let conflictedFileCount = 0;
     const changedFilesWithoutNumstat = new Set<string>();
     const untrackedRoots: string[] = [];
 
@@ -2289,6 +2361,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       }
       if (line.length > 0 && !line.startsWith("#")) {
         hasWorkingTreeChanges = true;
+        if (line.startsWith("u ")) conflictedFileCount += 1;
         const pathValue = parsePorcelainPath(line);
         if (pathValue) {
           changedFilesWithoutNumstat.add(pathValue);
@@ -2374,6 +2447,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       aheadCount,
       behindCount,
       aheadOfDefaultCount,
+      ...(rebase ? { rebase: { ...rebase, conflictedFileCount } } : {}),
     };
   });
 
@@ -2631,6 +2705,201 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
     return { commitSha };
   });
+
+  const amendCommit: GitVcsDriver.GitVcsDriver["Service"]["amendCommit"] = Effect.fn("amendCommit")(
+    function* (input) {
+      const { cwd } = input;
+      const head = yield* executeGit(
+        "GitVcsDriver.amendCommit.head",
+        cwd,
+        ["rev-parse", "--verify", "--quiet", "HEAD"],
+        { allowNonZeroExit: true },
+      );
+      if (head.exitCode !== 0) {
+        return yield* new GitCommandError({
+          operation: "GitVcsDriver.amendCommit",
+          command: "git commit",
+          cwd,
+          detail: "There is no commit to amend.",
+        });
+      }
+      const pushedTo = yield* runGitStdout("GitVcsDriver.amendCommit.pushed", cwd, [
+        "for-each-ref",
+        "--contains",
+        "HEAD",
+        "--count=1",
+        "--format=%(refname)",
+        "refs/remotes",
+      ]);
+      if (pushedTo.trim().length > 0) {
+        return yield* new GitCommandError({
+          operation: "GitVcsDriver.amendCommit",
+          command: "git commit",
+          cwd,
+          detail: "The last commit is already pushed. Amending it would need a force push.",
+        });
+      }
+      const rewordOnly = input.filePaths !== undefined && input.filePaths.length === 0;
+      if (!rewordOnly) {
+        yield* stageCommitChanges(cwd, input.filePaths);
+      }
+      yield* runGit(
+        "GitVcsDriver.amendCommit.commit",
+        cwd,
+        [
+          "commit",
+          "--amend",
+          // --only with no paths leaves the index out, so only the message changes.
+          ...(rewordOnly ? ["--only"] : []),
+          ...(input.commitMessage === undefined ? ["--no-edit"] : ["-m", input.commitMessage]),
+        ],
+        { timeoutMs: COMMIT_HOOK_TIMEOUT_MS, maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES },
+      );
+      const commitSha = yield* runGitStdout("GitVcsDriver.amendCommit.revParseHead", cwd, [
+        "rev-parse",
+        "HEAD",
+      ]);
+      return { commitSha: commitSha.trim() };
+    },
+  );
+
+  const readHeadCommitMessage: GitVcsDriver.GitVcsDriver["Service"]["readHeadCommitMessage"] =
+    Effect.fn("readHeadCommitMessage")(function* (cwd) {
+      const head = yield* executeGit(
+        "GitVcsDriver.readHeadCommitMessage.head",
+        cwd,
+        ["rev-parse", "--verify", "--quiet", "HEAD"],
+        { allowNonZeroExit: true },
+      );
+      if (head.exitCode !== 0) return null;
+      const message = yield* runGitStdoutWithOptions(
+        "GitVcsDriver.readHeadCommitMessage",
+        cwd,
+        ["log", "-1", "--format=%B", "HEAD", "--"],
+        { maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES },
+      );
+      return message.trim();
+    });
+
+  const rebase: GitVcsDriver.GitVcsDriver["Service"]["rebase"] = Effect.fn("rebase")(
+    function* (input) {
+      const { cwd } = input;
+      const gitDir = (yield* runGitStdout("GitVcsDriver.rebase.gitDir", cwd, [
+        "rev-parse",
+        "--absolute-git-dir",
+      ])).trim();
+      const before = yield* readRebaseState(gitDir);
+      if (before === null) {
+        return yield* new GitCommandError({
+          operation: "GitVcsDriver.rebase",
+          command: "git rebase",
+          cwd,
+          detail: "No rebase is in progress.",
+        });
+      }
+      if (input.action === "abort") {
+        yield* runGit("GitVcsDriver.rebase.abort", cwd, ["rebase", "--abort"]);
+        return { status: "aborted" as const };
+      }
+      const conflicted = yield* runGitStdout("GitVcsDriver.rebase.conflicts", cwd, [
+        "diff",
+        "--name-only",
+        "--diff-filter=U",
+      ]);
+      if (conflicted.trim().length > 0) {
+        return yield* new GitCommandError({
+          operation: "GitVcsDriver.rebase",
+          command: "git rebase",
+          cwd,
+          detail: "Resolve and stage the conflicted files before continuing.",
+        });
+      }
+      const result = yield* executeGit(
+        "GitVcsDriver.rebase.continue",
+        cwd,
+        ["rebase", "--continue"],
+        {
+          allowNonZeroExit: true,
+          // Keeps each commit's message instead of waiting on an editor nobody can see.
+          env: { GIT_EDITOR: "true" },
+          timeoutMs: COMMIT_HOOK_TIMEOUT_MS,
+          maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES,
+        },
+      );
+      const after = yield* readRebaseState(gitDir);
+      if (after === null && result.exitCode === 0) return { status: "finished" as const };
+      // Git exits non-zero when it stops on the next conflict, so only a stalled step is a failure.
+      if (after !== null && (result.exitCode === 0 || after.step !== before.step)) {
+        return { status: "stopped" as const };
+      }
+      const reason = classifyGitFailure(result.stderr);
+      return yield* new GitCommandError({
+        ...gitCommandContext({
+          operation: "GitVcsDriver.rebase.continue",
+          cwd,
+          args: ["rebase", "--continue"],
+        }),
+        ...(reason === null ? {} : { reason }),
+        detail: "Git could not continue the rebase. Check the repository in a terminal.",
+        ...(result.exitCode === null ? {} : { exitCode: result.exitCode }),
+        stdoutLength: result.stdout.length,
+        stderrLength: result.stderr.length,
+      });
+    },
+  );
+
+  const listStashes: GitVcsDriver.GitVcsDriver["Service"]["listStashes"] = Effect.fn("listStashes")(
+    function* (cwd) {
+      const stdout = yield* runGitStdoutWithOptions(
+        "GitVcsDriver.listStashes",
+        cwd,
+        ["stash", "list", "-z", "--format=%H%x1f%gs%x1f%cI"],
+        { maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES },
+      );
+      return { stashes: parseStashList(stdout) };
+    },
+  );
+
+  const stash: GitVcsDriver.GitVcsDriver["Service"]["stash"] = Effect.fn("stash")(
+    function* (input) {
+      const { cwd } = input;
+      if (input.action === "push") {
+        yield* runGit("GitVcsDriver.stash.push", cwd, [
+          "stash",
+          "push",
+          "--include-untracked",
+          ...(input.message === undefined ? [] : ["-m", input.message]),
+        ]);
+        return;
+      }
+      const { stashes } = yield* listStashes(cwd);
+      const index = stashes.findIndex((entry) => entry.sha === input.sha);
+      if (index === -1) {
+        return yield* new GitCommandError({
+          operation: "GitVcsDriver.stash",
+          command: "git stash",
+          cwd,
+          detail: "That stash no longer exists.",
+        });
+      }
+      if (input.action === "drop") {
+        yield* runGit("GitVcsDriver.stash.drop", cwd, ["stash", "drop", `stash@{${index}}`]);
+        return;
+      }
+      const args = ["stash", "apply", input.sha];
+      const result = yield* executeGitWithStableDiagnostics("GitVcsDriver.stash.apply", cwd, args, {
+        allowNonZeroExit: true,
+      });
+      if (result.exitCode === 0) return;
+      return yield* new GitCommandError({
+        ...gitCommandContext({ operation: "GitVcsDriver.stash.apply", cwd, args }),
+        detail: stashApplyFailureDetail(result.stderr),
+        ...(result.exitCode === null ? {} : { exitCode: result.exitCode }),
+        stdoutLength: result.stdout.length,
+        stderrLength: result.stderr.length,
+      });
+    },
+  );
 
   // `push -u` exits 0 without the upstream when another writer holds the config lock.
   const recordPushedUpstream = Effect.fn("recordPushedUpstream")(
@@ -5077,6 +5346,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     commit: Effect.fnUntraced(function* (cwd, subject, body, options) {
       return yield* withListRefsInvalidation(cwd, commit(cwd, subject, body, options));
     }),
+    amendCommit: Effect.fnUntraced(function* (input) {
+      return yield* withListRefsInvalidation(input.cwd, amendCommit(input));
+    }),
+    readHeadCommitMessage,
+    rebase: Effect.fnUntraced(function* (input) {
+      return yield* withListRefsInvalidation(input.cwd, rebase(input));
+    }),
+    listStashes,
+    stash,
     pushCurrentBranch: Effect.fnUntraced(function* (cwd, fallbackBranch, options) {
       return yield* withListRefsInvalidation(cwd, pushCurrentBranch(cwd, fallbackBranch, options));
     }),

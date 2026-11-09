@@ -20,6 +20,12 @@ import {
   type VcsCreateRefResult,
   type VcsCreateWorktreeInput,
   type VcsCreateWorktreeResult,
+  type GitAmendCommitInput,
+  type GitAmendCommitResult,
+  type GitListStashesResult,
+  type GitRebaseInput,
+  type GitRebaseResult,
+  type GitStashInput,
   type ReviewBranchCommitsInput,
   type ReviewBranchCommitsResult,
   type ReviewDiffPreviewInput,
@@ -30,6 +36,7 @@ import {
   type VcsListRefsInput,
   type VcsListRefsResult,
   type VcsPullResult,
+  type VcsRebaseStatus,
   type VcsRemoveWorktreeInput,
   type VcsStatusInput,
   type VcsStatusResult,
@@ -85,6 +92,7 @@ export interface GitStatusDetails {
   aheadCount: number;
   behindCount: number;
   aheadOfDefaultCount: number;
+  rebase?: VcsRebaseStatus;
 }
 
 export interface GitLocalStatusOptions {
@@ -331,6 +339,13 @@ export class GitVcsDriver extends Context.Service<
       body: string,
       options?: GitCommitOptions,
     ) => Effect.Effect<{ commitSha: string }, GitCommandError>;
+    readonly amendCommit: (
+      input: GitAmendCommitInput,
+    ) => Effect.Effect<GitAmendCommitResult, GitCommandError>;
+    readonly readHeadCommitMessage: (cwd: string) => Effect.Effect<string | null, GitCommandError>;
+    readonly rebase: (input: GitRebaseInput) => Effect.Effect<GitRebaseResult, GitCommandError>;
+    readonly listStashes: (cwd: string) => Effect.Effect<GitListStashesResult, GitCommandError>;
+    readonly stash: (input: GitStashInput) => Effect.Effect<void, GitCommandError>;
     readonly pushCurrentBranch: (
       cwd: string,
       fallbackBranch: string | null,

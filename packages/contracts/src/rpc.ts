@@ -143,6 +143,15 @@ import {
   VcsRemoveWorktreeInput,
   GitResolvePullRequestResult,
   GitRunStackedActionInput,
+  GitAmendCommitInput,
+  GitAmendCommitResult,
+  GitReadHeadCommitMessageInput,
+  GitReadHeadCommitMessageResult,
+  GitRebaseInput,
+  GitRebaseResult,
+  GitListStashesInput,
+  GitListStashesResult,
+  GitStashInput,
   VcsStatusInput,
   VcsStatusSubscriptionInput,
   VcsStatusResult,
@@ -462,6 +471,11 @@ export const WS_METHODS = {
   gitRunStackedAction: "git.runStackedAction",
   gitResolvePullRequest: "git.resolvePullRequest",
   gitPreparePullRequestThread: "git.preparePullRequestThread",
+  gitAmendCommit: "git.amendCommit",
+  gitReadHeadCommitMessage: "git.readHeadCommitMessage",
+  gitRebase: "git.rebase",
+  gitListStashes: "git.listStashes",
+  gitStash: "git.stash",
 
   reviewGetBranchCommits: "review.getBranchCommits",
   reviewGetDiffPreview: "review.getDiffPreview",
@@ -1500,6 +1514,35 @@ const WsGitPreparePullRequestThreadRpc = Rpc.make(WS_METHODS.gitPreparePullReque
   error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
 });
 
+const WsGitAmendCommitRpc = Rpc.make(WS_METHODS.gitAmendCommit, {
+  payload: GitAmendCommitInput,
+  success: GitAmendCommitResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitReadHeadCommitMessageRpc = Rpc.make(WS_METHODS.gitReadHeadCommitMessage, {
+  payload: GitReadHeadCommitMessageInput,
+  success: GitReadHeadCommitMessageResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitRebaseRpc = Rpc.make(WS_METHODS.gitRebase, {
+  payload: GitRebaseInput,
+  success: GitRebaseResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitListStashesRpc = Rpc.make(WS_METHODS.gitListStashes, {
+  payload: GitListStashesInput,
+  success: GitListStashesResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitStashRpc = Rpc.make(WS_METHODS.gitStash, {
+  payload: GitStashInput,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
 const WsVcsListRefsRpc = Rpc.make(WS_METHODS.vcsListRefs, {
   payload: VcsListRefsInput,
   success: VcsListRefsResult,
@@ -2147,6 +2190,11 @@ export const WsRpcGroup = RpcGroup.make(
   WsGitRunStackedActionRpc,
   WsGitResolvePullRequestRpc,
   WsGitPreparePullRequestThreadRpc,
+  WsGitAmendCommitRpc,
+  WsGitReadHeadCommitMessageRpc,
+  WsGitRebaseRpc,
+  WsGitListStashesRpc,
+  WsGitStashRpc,
   WsVcsListRefsRpc,
   WsVcsCreateWorktreeRpc,
   WsVcsRemoveWorktreeRpc,

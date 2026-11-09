@@ -364,3 +364,38 @@ export function resolveDefaultBranchActionDialogCopy(input: {
     continueLabel: `Push & create ${shortLabel}`,
   };
 }
+
+export interface GitRebasePresentation {
+  readonly label: string;
+  /** Short enough for a narrow row: the conflict count, or that the rebase can continue. */
+  readonly summary: string;
+  readonly continueDisabledReason: string | null;
+}
+
+export function resolveRebasePresentation(
+  gitStatus: VcsStatusResult | null,
+): GitRebasePresentation | null {
+  const rebase = gitStatus?.rebase;
+  if (!rebase) return null;
+  const progress =
+    rebase.step !== null && rebase.total !== null ? ` (${rebase.step}/${rebase.total})` : "";
+  const conflicts = rebase.conflictedFileCount;
+  const files = conflicts === 1 ? "file" : "files";
+  return {
+    label: `Rebasing ${rebase.refName ?? "detached HEAD"}${progress}`,
+    summary:
+      conflicts > 0 ? `${conflicts} ${conflicts === 1 ? "conflict" : "conflicts"}` : "No conflicts",
+    continueDisabledReason:
+      conflicts > 0 ? `Resolve and stage ${conflicts} conflicted ${files} first.` : null,
+  };
+}
+
+/** Amending a pushed commit would need a force push, which T3 Code does not do. */
+export function resolveAmendUnavailableReason(gitStatus: VcsStatusResult | null): string | null {
+  if (!gitStatus) return "Git status is unavailable.";
+  if (gitStatus.refName === null) return "Check out a branch before amending.";
+  if (gitStatus.aheadCount > 0 || !gitStatus.hasPrimaryRemote) return null;
+  return gitStatus.hasUpstream
+    ? "The last commit is already pushed."
+    : "No local commits to amend.";
+}

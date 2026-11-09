@@ -40,6 +40,9 @@ export const VcsActionOperation = Schema.Literals([
   "init",
   "publish_repository",
   "prepare_pull_request_thread",
+  "amend_commit",
+  "rebase",
+  "stash",
 ]);
 export type VcsActionOperation = typeof VcsActionOperation.Type;
 

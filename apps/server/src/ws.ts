@@ -3173,6 +3173,14 @@ export const layerWsRpc = (
             .preparePullRequestThread(input)
             .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
         [WS_METHODS.vcsListRefs]: (input) => gitWorkflow.listRefs(input),
+        [WS_METHODS.gitAmendCommit]: (input) =>
+          gitWorkflow.amendCommit(input).pipe(Effect.ensuring(refreshGitStatus(input.cwd))),
+        [WS_METHODS.gitReadHeadCommitMessage]: (input) => gitWorkflow.readHeadCommitMessage(input),
+        [WS_METHODS.gitRebase]: (input) =>
+          gitWorkflow.rebase(input).pipe(Effect.ensuring(refreshGitStatus(input.cwd))),
+        [WS_METHODS.gitListStashes]: (input) => gitWorkflow.listStashes(input),
+        [WS_METHODS.gitStash]: (input) =>
+          gitWorkflow.stash(input).pipe(Effect.ensuring(refreshGitStatus(input.cwd))),
         [WS_METHODS.vcsCreateWorktree]: (input) =>
           gitWorkflow.createWorktree(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
         [WS_METHODS.vcsRemoveWorktree]: (input) =>

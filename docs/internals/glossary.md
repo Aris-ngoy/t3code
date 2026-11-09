@@ -12,6 +12,7 @@ Terms whose meaning matters across T3 Code. Architecture and lifecycle constrain
 | Project        | An environment-local workspace record rooted at a directory.                                      |
 | Workspace root | The project's base filesystem directory on the environment.                                       |
 | Worktree       | A separate Git checkout a thread can use instead of the project's main checkout.                  |
+| Git stash      | Uncommitted changes Git set aside. One list per repository, shared by all its worktrees.          |
 | Thread         | The durable conversation and work history for a project. It survives provider process exits.      |
 | Turn           | One user-to-agent cycle, a V2 run. Provider work can end before checkpoint and diff work settles. |
 | Activity       | A non-message timeline item, such as a tool action, approval, or failure.                         |
@@ -62,3 +63,9 @@ Terms whose meaning matters across T3 Code. Architecture and lifecycle constrain
 | Attachment inventory | The ordered image records shown as thumbnails above the prose, including images with no inline references.                          |
 
 See [composer context references](./composer-context-references.md) for the contract and lifecycle.
+
+## Composer chrome
+
+| Term         | Meaning                                                                 |
+| ------------ | ----------------------------------------------------------------------- |
+| Prompt stash | Unsent composer drafts set aside for later. Not related to Git stashes. |

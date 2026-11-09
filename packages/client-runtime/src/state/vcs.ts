@@ -17,6 +17,7 @@ import { Atom, AtomRegistry } from "effect/reactivity";
 
 import {
   createEnvironmentRpcCommand,
+  createEnvironmentRpcQueryAtomFamily,
   createEnvironmentRpcSubscriptionAtomFamily,
   createEnvironmentSubscriptionAtomFamily,
 } from "./runtime.ts";
@@ -365,6 +366,37 @@ export function createVcsEnvironmentAtoms<R, E>(
       scheduler: vcsCommandScheduler,
       concurrency: vcsCommandConcurrency,
       onSettled: invalidateRefs,
+    }),
+    amendCommit: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:vcs:amend-commit",
+      tag: WS_METHODS.gitAmendCommit,
+      scheduler: vcsCommandScheduler,
+      concurrency: vcsCommandConcurrency,
+      onSettled: invalidateRefs,
+    }),
+    // Both reads back dialogs: dropping them when closed makes each opening read Git afresh.
+    headCommitMessage: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:vcs:head-commit-message",
+      tag: WS_METHODS.gitReadHeadCommitMessage,
+      idleTtlMs: 0,
+    }),
+    rebase: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:vcs:rebase",
+      tag: WS_METHODS.gitRebase,
+      scheduler: vcsCommandScheduler,
+      concurrency: vcsCommandConcurrency,
+      onSettled: invalidateRefs,
+    }),
+    stashes: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:vcs:stashes",
+      tag: WS_METHODS.gitListStashes,
+      idleTtlMs: 0,
+    }),
+    stash: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:vcs:stash",
+      tag: WS_METHODS.gitStash,
+      scheduler: vcsCommandScheduler,
+      concurrency: vcsCommandConcurrency,
     }),
   };
 }

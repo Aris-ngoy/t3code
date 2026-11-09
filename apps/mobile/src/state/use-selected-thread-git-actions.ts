@@ -62,6 +62,7 @@ export function useSelectedThreadGitActions() {
   const createRef = useAtomCommand(vcsEnvironment.createRef, { reportFailure: false });
   const createWorktree = useAtomCommand(vcsEnvironment.createWorktree, { reportFailure: false });
   const pull = useAtomCommand(vcsEnvironment.pull, { reportFailure: false });
+  const rebase = useAtomCommand(vcsEnvironment.rebase, { reportFailure: false });
   const { selectedThread, selectedThreadProject } = useThreadSelection();
   const canWriteSourceControl = useEnvironmentScope(
     selectedThread?.environmentId ?? null,
@@ -356,6 +357,33 @@ export function useSelectedThreadGitActions() {
     );
   };
 
+  const onRebaseSelectedThread = async (action: "continue" | "abort") => {
+    await runSelectedThreadGitMutation(
+      "rebase",
+      action === "abort" ? "Aborting rebase" : "Continuing rebase",
+      async ({ thread, cwd }) => {
+        const result = await rebase({
+          environmentId: thread.environmentId,
+          input: { cwd, action },
+        });
+        if (AsyncResult.isFailure(result)) {
+          return result;
+        }
+        await refreshSelectedThreadGitStatus({ quiet: true, cwd });
+        showGitActionResult({
+          type: "success",
+          title:
+            result.value.status === "finished"
+              ? "Rebase finished"
+              : result.value.status === "aborted"
+                ? "Rebase aborted"
+                : "Rebase stopped at the next step",
+        });
+        return result;
+      },
+    );
+  };
+
   const onRunSelectedThreadGitAction = async (
     input: GitActionRequestInput,
   ): Promise<GitRunStackedActionResult | null> => {
@@ -412,6 +440,7 @@ export function useSelectedThreadGitActions() {
     onCreateSelectedThreadBranch,
     onCreateSelectedThreadWorktree,
     onPullSelectedThreadBranch,
+    onRebaseSelectedThread,
     onRunSelectedThreadGitAction,
   };
 }

@@ -202,6 +202,79 @@ export const VcsInitInput = Schema.Struct({
 });
 export type VcsInitInput = typeof VcsInitInput.Type;
 
+export const GitAmendCommitInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+  /** Absent keeps the commit's message. */
+  commitMessage: Schema.optional(TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(10_000))),
+  /** Absent stages every change; empty rewords the commit without staging anything. */
+  filePaths: Schema.optional(Schema.Array(GitFilePath)),
+});
+export type GitAmendCommitInput = typeof GitAmendCommitInput.Type;
+
+export const GitAmendCommitResult = Schema.Struct({
+  commitSha: TrimmedNonEmptyStringSchema,
+});
+export type GitAmendCommitResult = typeof GitAmendCommitResult.Type;
+
+export const GitReadHeadCommitMessageInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+});
+export type GitReadHeadCommitMessageInput = typeof GitReadHeadCommitMessageInput.Type;
+
+export const GitReadHeadCommitMessageResult = Schema.Struct({
+  /** Null when the branch has no commits. */
+  message: Schema.NullOr(Schema.String),
+});
+export type GitReadHeadCommitMessageResult = typeof GitReadHeadCommitMessageResult.Type;
+
+export const GitRebaseInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+  action: Schema.Literals(["continue", "abort"]),
+});
+export type GitRebaseInput = typeof GitRebaseInput.Type;
+
+export const GitRebaseResult = Schema.Struct({
+  /** `stopped` means the rebase paused again, on a conflict or an edit step. */
+  status: Schema.Literals(["finished", "stopped", "aborted"]),
+});
+export type GitRebaseResult = typeof GitRebaseResult.Type;
+
+const GitStashSha = TrimmedNonEmptyStringSchema.check(Schema.isPattern(/^[0-9a-f]{40,64}$/));
+
+export const GitStash = Schema.Struct({
+  sha: GitStashSha,
+  /** The branch the stash was made on; null when made on a detached HEAD. */
+  refName: Schema.NullOr(TrimmedNonEmptyStringSchema),
+  message: Schema.String,
+  createdAt: Schema.String,
+});
+export type GitStash = typeof GitStash.Type;
+
+export const GitListStashesInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+});
+export type GitListStashesInput = typeof GitListStashesInput.Type;
+
+export const GitListStashesResult = Schema.Struct({
+  stashes: Schema.Array(GitStash),
+});
+export type GitListStashesResult = typeof GitListStashesResult.Type;
+
+// Stashes are addressed by commit, since stash@{n} shifts when another stash is pushed or dropped.
+export const GitStashInput = Schema.Union([
+  Schema.Struct({
+    cwd: TrimmedNonEmptyStringSchema,
+    action: Schema.Literal("push"),
+    message: Schema.optional(TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(1_000))),
+  }),
+  Schema.Struct({
+    cwd: TrimmedNonEmptyStringSchema,
+    action: Schema.Literals(["apply", "drop"]),
+    sha: GitStashSha,
+  }),
+]);
+export type GitStashInput = typeof GitStashInput.Type;
+
 const VcsStatusChangeRequest = Schema.Struct({
   number: PositiveInt,
   title: TrimmedNonEmptyStringSchema,
@@ -212,6 +285,15 @@ const VcsStatusChangeRequest = Schema.Struct({
   isDraft: Schema.optional(Schema.Boolean),
   updatedAt: Schema.optional(Schema.NullOr(Schema.String)),
 });
+
+const VcsRebaseStatus = Schema.Struct({
+  /** The branch being rebased; null when rebasing a detached HEAD. */
+  refName: Schema.NullOr(TrimmedNonEmptyStringSchema),
+  step: Schema.NullOr(PositiveInt),
+  total: Schema.NullOr(PositiveInt),
+  conflictedFileCount: NonNegativeInt,
+});
+export type VcsRebaseStatus = typeof VcsRebaseStatus.Type;
 
 const VcsStatusLocalShape = {
   isRepo: Schema.Boolean,
@@ -240,7 +322,8 @@ const VcsStatusLocalShape = {
       insertions: NonNegativeInt,
       deletions: NonNegativeInt,
     }),
-  ),
+  ) /** Present while a rebase is stopped in this worktree. */,
+  rebase: Schema.optional(VcsRebaseStatus),
 };
 
 const VcsStatusRemoteShape = {
